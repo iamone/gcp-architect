@@ -1,0 +1,35 @@
+
+gcloud beta container clusters create private-cluster \
+    --enable-private-nodes \
+    --master-ipv4-cidr 172.16.0.16/28 \
+    --enable-ip-alias \
+    --create-subnetwork "" \
+    --machine-type e2-medium
+
+gcloud compute networks subnets list --network default
+
+gcloud compute networks subnets describe gke-private-cluster-87f0ee3a-pe-subnet --region=$REGION
+
+gcloud compute networks subnets describe gke-private-cluster-subnet-172c9d9a --region=$REGION
+
+gcloud compute instances create source-instance --zone=$ZONE --machine-type=e2-medium --scopes 'https://www.googleapis.com/auth/cloud-platform'
+gcloud compute instances describe source-instance --zone=$ZONE | grep natIP
+
+gcloud container clusters update private-cluster \
+    --enable-master-authorized-networks \
+    --master-authorized-networks 34.185.192.167/32
+
+gcloud container clusters update private-cluster2 \
+    --enable-master-authorized-networks \
+    --zone=$ZONE \
+    --master-authorized-networks 34.185.192.167/32
+
+gcloud compute ssh source-instance --zone=$ZONE
+
+sudo apt-get install kubectl
+
+sudo apt-get install google-cloud-sdk-gke-gcloud-auth-plugin
+gcloud container clusters get-credentials private-cluster --zone=$ZONE
+
+
+kubectl get nodes --output wide
