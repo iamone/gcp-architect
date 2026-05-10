@@ -1,0 +1,167 @@
+
+export REGION=us-west1
+export ZONE=us-west1-b
+export MACHINE_TYPE=e2-small
+export TAG=network-lb-tag
+export IMAGE_FAMILY=debian-12
+export IMAGE_PROJECT=debian-cloud
+
+
+gcloud config set compute/zone $ZONE
+gcloud config set compute/region $REGION
+
+
+
+
+gcloud compute instances create web1 \
+    --zone=$ZONE \
+    --tags=$TAG \
+    --machine-type=$MACHINE_TYPE \
+    --image-family=$IMAGE_FAMILY \
+    --image-project=$IMAGE_PROJECT \
+    --metadata=startup-script='#!/bin/bash
+    apt-get update
+    apt-get install apache2 -y
+    service apache2 restart
+    echo "<h3>Web Server: web1</h3>" | tee /var/www/html/index.html'
+
+gcloud compute instances create web2 \
+    --zone=$ZONE \
+    --tags=$TAG \
+    --machine-type=$MACHINE_TYPE \
+    --image-family=$IMAGE_FAMILY \
+    --image-project=$IMAGE_PROJECT \
+    --metadata=startup-script='#!/bin/bash
+    apt-get update
+    apt-get install apache2 -y
+    service apache2 restart
+    echo "<h3>Web Server: web2</h3>" | tee /var/www/html/index.html'
+
+
+gcloud compute instances create web3 \
+    --zone=$ZONE \
+    --tags=$TAG \
+    --machine-type=$MACHINE_TYPE \
+    --image-family=$IMAGE_FAMILY \
+    --image-project=$IMAGE_PROJECT \
+    --metadata=startup-script='#!/bin/bash
+    apt-get update
+    apt-get install apache2 -y
+    service apache2 restart
+    echo "<h3>Web Server: web3</h3>" | tee /var/www/html/index.html'
+
+gcloud compute firewall-rules create $FIREWALL \
+    --target-tags $TAG --allow tcp:80
+
+
+#------------
+
+export EXTERNAL_IP_NAME=network-lb-ip-1
+export TARGET_POOL=www-pool
+export PORT=80
+
+
+gcloud compute addresses create $EXTERNAL_IP_NAME \
+  --region $REGION
+
+gcloud compute http-health-checks create basic-check
+
+gcloud compute target-pools create $TARGET_POOL \
+  --region $REGION --http-health-check basic-check
+
+gcloud compute target-pools add-instances $TARGET_POOL \
+    --instances web1,web2,web3
+
+gcloud compute forwarding-rules create web-rule \
+    --region $REGION \
+    --ports $PORT \
+    --address $EXTERNAL_IP_NAME \
+    --target-pool $TARGET_POOL
+
+
+#------------
+
+
+export BACKEND_TEMPLATE=lb-backend-template
+export TAG=allow-health-check
+export MIG=lb-backend-group
+export MACHINE_TYPE=e2-medium
+export IMAGE_FAMILY=debian-12
+export IMAGE_PROJECT=debian-cloud
+export FW_RULE=fw-allow-health-check
+export SOURCE_RANGES=130.211.0.0/22,35.191.0.0/16
+export TRAFFIC=ingress
+export PORT=80
+export EXTERNAL_IP_NAME=lb-ipv4-1
+export HEALTH_CHECK=http-basic-check
+export URL_MAP=web-map-http
+export TARGET_PROXY=http-lb-proxy
+export BACKEND_SERVICE=web-backend-service
+
+
+gcloud compute instance-templates create $BACKEND_TEMPLATE \
+   --region=$REGION \
+   --network=default \
+   --subnet=default \
+   --tags=$TAG \
+   --machine-type=$MACHINE_TYPE \
+   --image-family=$IMAGE_FAMILY \
+   --image-project=$IMAGE_PROJECT \
+   --metadata=startup-script='#!/bin/bash
+     apt-get update
+     apt-get install apache2 -y
+     a2ensite default-ssl
+     a2enmod ssl
+     vm_hostname="$(curl -H "Metadata-Flavor:Google" \
+     http://169.254.169.254/computeMetadata/v1/instance/name)"
+     echo "Page served from: $vm_hostname" | \
+     tee /var/www/html/index.html
+     systemctl restart apache2'
+
+
+gcloud compute instance-groups managed create $MIG \
+   --template=$BACKEND_TEMPLATE --size=2 --zone=$ZONE
+
+gcloud compute firewall-rules create $FW_RULE \
+  --network=default \
+  --action=allow \
+  --direction=$TRAFFIC \
+  --source-ranges=$SOURCE_RANGES \
+  --target-tags=$TAG \
+  --rules=tcp:$PORT
+
+gcloud compute addresses create $EXTERNAL_IP_NAME \
+  --ip-version=IPV4 \
+  --global
+
+gcloud compute addresses describe $EXTERNAL_IP_NAME \
+  --format="get(address)" \
+  --global
+
+# 34.120.93.66
+
+gcloud compute health-checks create http $HEALTH_CHECK \
+  --port $PORT
+
+gcloud compute backend-services create $BACKEND_SERVICE \
+  --protocol=HTTP \
+  --port-name=http \
+  --health-checks=$HEALTH_CHECK \
+  --global
+
+gcloud compute backend-services add-backend $BACKEND_SERVICE \
+  --instance-group=$MIG \
+  --instance-group-zone=$ZONE \
+  --global
+
+gcloud compute url-maps create $URL_MAP \
+    --default-service web-backend-service
+
+gcloud compute target-http-proxies create $TARGET_PROXY \
+    --url-map $URL_MAP
+
+gcloud compute forwarding-rules create http-content-rule \
+   --address=$EXTERNAL_IP_NAME \
+   --global \
+   --target-http-proxy=$TARGET_PROXY \
+   --ports=$PORT
