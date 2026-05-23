@@ -1,0 +1,346 @@
+export PATH=$PATH:"/home/${USER}/.local/bin"
+python3 -m pip install google-adk[otel-gcp]==1.30.0 -r adk_project/requirements.txt
+
+cd ~/adk_project
+cat << EOF > my_google_search_agent/.env
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
+GOOGLE_CLOUD_PROJECT=qwiklabs-gcp-02-07954767c6f4
+GOOGLE_CLOUD_LOCATION=global
+MODEL=gemini-3.5-flash
+OTEL_SERVICE_NAME=adk-agent
+OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true
+OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true
+EOF
+
+
+
+
+adk web \
+--allow_origins "regex:https://.*\.cloudshell\.dev" \
+--otel_to_cloud \
+--reload_agents
+
+#----
+
+
+export GOOGLE_GENAI_USE_VERTEXAI=TRUE
+export GOOGLE_CLOUD_PROJECT=qwiklabs-gcp-02-07954767c6f4
+export GOOGLE_CLOUD_LOCATION=global
+export MODEL=gemini-3.5-flash
+
+
+#----------------- agent.py
+
+import os
+import sys
+
+# Define base paths relative to this file
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+ADK_PROJECT_DIR = os.path.dirname(CURRENT_DIR)
+BUCKET_DATA_DIR = os.path.dirname(ADK_PROJECT_DIR)
+
+# Add paths to sys.path if not already present to allow absolute imports
+if ADK_PROJECT_DIR not in sys.path:
+    sys.path.append(ADK_PROJECT_DIR)
+if BUCKET_DATA_DIR not in sys.path:
+    sys.path.append(BUCKET_DATA_DIR)
+
+import asyncio
+from dotenv import load_dotenv
+from google.adk import Agent
+from google.adk.runners import InMemoryRunner
+from google.adk.sessions import Session
+from google.genai import types
+from google.adk.models import Gemini, LlmResponse
+from google.adk.apps.app import App
+
+from adk_utils.plugins import LabExUtils
+
+import logging
+import google.cloud.logging
+################
+from pydantic import BaseModel, Field
+
+class CountryCapital(BaseModel):
+    capital: str = Field(description="A country's capital.")
+
+
+# 1. Load environment variables from the agent directory's .env file
+load_dotenv()
+model_name = os.getenv("MODEL")
+
+# Retry options help avoid the occasional error from popular models
+# receiving too many requests at once.
+RETRY_OPTIONS = types.HttpRetryOptions(initial_delay=1, max_delay=3, attempts=30)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
+
+cloud_logging_client = google.cloud.logging.Client()
+cloud_logging_client.setup_logging()
+
+# Create an async main function
+async def main():
+
+    # 2. Set or load other variables
+    app_name = 'app_agent'
+    user_id_1 = 'user1'
+
+    # 3. Define Your Agent
+    root_agent = Agent(
+        model=Gemini(model=model_name, retry_options=RETRY_OPTIONS),
+        name="trivia_agent",
+            instruction="Answer questions.",
+##############
+        output_schema=CountryCapital
+    )
+
+    plugins = [LabExUtils()]
+
+    app = App(
+        name=app_name,
+        root_agent=root_agent,
+        plugins=plugins
+    )
+
+    # 3. Create a Runner
+    runner = InMemoryRunner(app=app)
+
+    # 4. Create a session
+    my_session = await runner.session_service.create_session(
+        app_name=app_name, user_id=user_id_1
+    )
+
+    # 5. Prepare a function to package a user's message as
+    # genai.types.Content, run it asynchronously, and iterate
+    # through the response 
+    async def run_prompt(session: Session, new_message: str):
+        content = types.Content(
+                role='user', parts=[types.Part.from_text(text=new_message)]
+            )
+        logging.info(f'** User says: {new_message}')
+        async for event in runner.run_async(
+            user_id=user_id_1,
+            session_id=session.id,
+            new_message=content,
+        ):
+            if event.content.parts and event.content.parts[0].text:
+                logging.info(f'** {event.author}: {event.content.parts[0].text}')
+
+
+    # 6. Use this function on a new query
+    query = "What is the capital of France?"
+    await run_prompt(my_session, query)
+
+    cloud_logging_client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+#-------------
+
+python3 app_agent/agent.py
+
+adk run my_google_search_agent
+
+#---------------- llm_auditor/agent.py
+
+"""LLM Auditor for verifying & refining LLM-generated answers using the web."""
+
+from google.adk.agents import SequentialAgent
+from google.adk.apps.app import App
+
+from .sub_agents.critic import critic_agent
+from .sub_agents.reviser import reviser_agent
+
+import logging
+import google.cloud.logging
+
+logging.basicConfig()
+
+cloud_logging_client = google.cloud.logging.Client()
+cloud_logging_client.setup_logging()
+
+
+llm_auditor = SequentialAgent(
+    name='llm_auditor',
+    description=(
+        'Evaluates LLM-generated answers, verifies actual accuracy using the'
+        ' web, and refines the response to ensure alignment with real-world'
+        ' knowledge.'
+    ),
+    sub_agents=[critic_agent, reviser_agent],
+)
+
+import sys
+import os
+
+# Append adk_project directory to path (2 levels up from llm_auditor/agent.py)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from adk_utils.plugins import LabExUtils
+
+plugins = [LabExUtils()]
+
+root_agent = llm_auditor
+
+app = App(
+    name="llm_auditor",
+    root_agent=root_agent,
+    plugins=plugins
+)
+
+# UNCOMMENT THE LINE BELOW TO TEST FAILOVER:
+# graceful_plugin.apply_test_failover(root_agent)
+
+
+#----------------
+
+
+#--------------- critic_agent/agent.py
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Critic agent for identifying and verifying statements using search tools."""
+
+import os
+from google.adk import Agent
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmResponse, Gemini
+from google.adk.tools import google_search
+from google.genai import types
+
+RETRY_OPTIONS = types.HttpRetryOptions(initial_delay=1, max_delay=3, attempts=30)
+
+import sys
+sys.path.append("../..")
+from callback_logging import log_query_to_model, log_model_response
+
+from . import prompt
+
+
+def _render_reference(
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> LlmResponse:
+    """Appends grounding references to the response."""
+    del callback_context
+    if (
+        not llm_response.content or
+        not llm_response.content.parts or
+        not llm_response.grounding_metadata
+    ):
+        return llm_response
+    references = []
+    for chunk in llm_response.grounding_metadata.grounding_chunks or []:
+        title, uri, text = '', '', ''
+        if chunk.retrieved_context:
+            title = chunk.retrieved_context.title
+            uri = chunk.retrieved_context.uri
+            text = chunk.retrieved_context.text
+        elif chunk.web:
+            title = chunk.web.title
+            uri = chunk.web.uri
+        parts = [s for s in (title, text) if s]
+        if uri and parts:
+            parts[0] = f'[{parts[0]}]({uri})'
+        if parts:
+            references.append('* ' + ': '.join(parts) + '\n')
+    if references:
+        reference_text = ''.join(['\n\nReference:\n\n'] + references)
+        llm_response.content.parts.append(types.Part(text=reference_text))
+    if all(part.text is not None for part in llm_response.content.parts):
+        all_text = '\n'.join(part.text for part in llm_response.content.parts)
+        llm_response.content.parts[0].text = all_text
+        del llm_response.content.parts[1:]
+    return llm_response
+
+
+critic_agent = Agent(
+    model=Gemini(model=os.getenv("MODEL"), retry_options=RETRY_OPTIONS),
+    name='critic_agent',
+    instruction=prompt.CRITIC_PROMPT,
+    tools=[google_search],
+    before_model_callback=log_query_to_model,
+    after_model_callback=_render_reference,
+    
+)
+
+
+#--------------
+
+#----------- reviser_agent/agent.py
+
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Reviser agent for correcting inaccuracies based on verified findings."""
+
+import os
+from google.adk import Agent
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmResponse, Gemini
+from google.genai import types
+
+RETRY_OPTIONS = types.HttpRetryOptions(initial_delay=1, max_delay=3, attempts=30)
+
+import sys
+sys.path.append("../..")
+from callback_logging import log_query_to_model, log_model_response
+
+from . import prompt
+
+_END_OF_EDIT_MARK = '---END-OF-EDIT---'
+
+
+def _remove_end_of_edit_mark(
+    callback_context: CallbackContext,
+    llm_response: LlmResponse,
+) -> LlmResponse:
+    del callback_context  # unused
+    if not llm_response.content or not llm_response.content.parts:
+        return llm_response
+    for idx, part in enumerate(llm_response.content.parts):
+        if _END_OF_EDIT_MARK in part.text:
+            del llm_response.content.parts[idx + 1 :]
+            part.text = part.text.split(_END_OF_EDIT_MARK, 1)[0]
+    return llm_response
+
+
+reviser_agent = Agent(
+    model=Gemini(model=os.getenv("MODEL"), retry_options=RETRY_OPTIONS),
+    name='reviser_agent',
+    instruction=prompt.REVISER_PROMPT,
+    before_model_callback=log_query_to_model,
+    after_model_callback=_remove_end_of_edit_mark,
+)
+
+
+#-------------------
+
