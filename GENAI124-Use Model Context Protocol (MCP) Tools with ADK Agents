@@ -1,0 +1,333 @@
+export PATH=$PATH:"/home/${USER}/.local/bin"
+python3 -m pip install google-adk==1.22.1 -r adk_mcp_tools/requirements.txt
+
+
+#--- requirements.txt
+
+mcp==1.10.1
+lxml
+beautifulsoup4
+
+#----
+
+cd ~/adk_mcp_tools
+cat << EOF > google_maps_mcp_agent/.env
+GOOGLE_GENAI_USE_VERTEXAI=TRUE
+GOOGLE_CLOUD_PROJECT=qwiklabs-gcp-02-8e4dc945a425
+GOOGLE_CLOUD_LOCATION=global
+GOOGLE_MAPS_API_KEY="YOUR_ACTUAL_API_KEY"
+MODEL=gemini-3.5-flash
+EOF
+
+cp google_maps_mcp_agent/.env adk_mcp_server/.env
+
+
+#--- google_maps_mcp_agent/agent.py
+
+import os
+from dotenv import load_dotenv
+import sys
+from google.adk.agents import LlmAgent
+from google.adk.apps.app import App
+
+# Add the parent directory to sys.path to allow importing from adk_utils
+# Note: this is from genAI104 and the directory is not the same. So may need to tweak.
+# Get the absolute path of the directory containing agent.py
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# Get the parent directory (adk_mcp_tools)
+parent_dir = os.path.dirname(current_dir)
+
+# Insert it at the beginning of the path list
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# Debug: Print the path so you can see it in the terminal logs
+print(f"DEBUG: Searching for modules in: {parent_dir}")
+
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, \
+                StdioServerParameters, StdioConnectionParams
+from google.genai import types
+from adk_utils.plugins import LabExUtils
+from google.adk.models import Gemini
+from google.genai.types import HttpRetryOptions
+
+load_dotenv()
+google_maps_api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+
+if not google_maps_api_key:
+    print("WARNING: GOOGLE_MAPS_API_KEY is not set. Please set it as an environment variable or update it in the script.")
+
+# Retry options help avoid the occasional error from popular models
+# receiving too many requests at once.
+RETRY_OPTIONS = types.HttpRetryOptions(initial_delay=1, max_delay=3, attempts=30)
+plugins = [LabExUtils()]
+
+root_agent = LlmAgent(
+    # name: A unique name for the agent.
+    name='maps_assistant_agent',
+    # description: A short description of the agent's purpose, so
+    # other agents in a multi-agent system know when to call it.
+    description="Use google maps to find directions.",
+    # model: The LLM model that the agent will use:
+    model=Gemini(model=os.getenv("MODEL"), retry_options=RETRY_OPTIONS),
+     # instruction: Instructions (or the prompt) for the agent.
+    instruction="""
+        Help the user with mapping, directions, and finding places
+        using Google Maps tools.
+    """,
+    # tools: functions to enhance the model's capabilities.
+    # Add the MCPToolset, by adding the google_search tool below.
+    tools=[
+        MCPToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command='npx',
+                args=[
+                    "-y",
+                    "@modelcontextprotocol/server-google-maps",
+                ],
+                env={
+                    "GOOGLE_MAPS_API_KEY": google_maps_api_key
+                }
+            ),
+            timeout=15,
+            ),
+        )
+    ],
+)
+
+app = App(
+    name="google_maps_mcp_agent",
+    root_agent=root_agent,
+    plugins=plugins
+)
+# UNCOMMENT THE LINE BELOW TO TEST FAILOVER:
+### Is there a way to add something here for testing purpose.
+
+#-------
+
+adk web
+--allow_origins "regex:https://.*.cloudshell.dev"
+--otel_to_cloud
+--reload_agents
+
+
+#---- adk_mcp_server/agent.py
+
+import os
+import sys
+from dotenv import load_dotenv
+from google.adk.agents import LlmAgent
+from google.adk.apps.app import App
+
+# Add the parent directory to sys.path to allow importing from adk_utils
+# Note: this is from genAI104 and the directory is not the same. So may need to tweak.
+# Get the absolute path of the directory containing agent.py
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# Get the parent directory (adk_mcp_tools)
+parent_dir = os.path.dirname(current_dir)
+
+# Insert it at the beginning of the path list
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+# Debug: Print the path so you can see it in the terminal logs
+print(f"DEBUG: Searching for modules in: {parent_dir}")
+
+from google.genai import types
+from adk_utils.plugins import LabExUtils
+from google.adk.models import Gemini
+from google.genai.types import HttpRetryOptions
+from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, \
+                    StdioServerParameters, StdioConnectionParams
+
+load_dotenv()
+
+# IMPORTANT: Replace this with the ABSOLUTE path to your adk_server.py script
+PATH_TO_YOUR_MCP_SERVER_SCRIPT = "/path/to/your/adk_server.py"
+
+# Retry options help avoid the occasional error from popular models
+# receiving too many requests at once.
+RETRY_OPTIONS = types.HttpRetryOptions(initial_delay=1, max_delay=3, attempts=30)
+plugins = [LabExUtils()]
+
+if PATH_TO_YOUR_MCP_SERVER_SCRIPT == "None":
+    print("WARNING: PATH_TO_YOUR_MCP_SERVER_SCRIPT is not set. Please update it in agent.py.")
+    # Optionally, raise an error if the path is critical
+
+root_agent = LlmAgent(
+    model=Gemini(model=os.getenv("MODEL"), retry_options=RETRY_OPTIONS),
+    # name: A unique name for the agent.
+    name='web_reader_mcp_client_agent',
+    # description: A short description of the agent's purpose, so
+    # other agents in a multi-agent system know when to call it.
+    description="Use an mcp server with your agent to read web pages.",
+    # instruction: Instructions (or the prompt) for the agent.
+    instruction="""
+        Use the 'load_web_page' tool to fetch content from a URL
+        provided by the user.
+     """,
+    # tools: functions to enhance the model's capabilities.
+    # Add the MCPToolset below:
+    tools=[
+        MCPToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command="python3", # Command to run your MCP server script
+                args=[PATH_TO_YOUR_MCP_SERVER_SCRIPT], # Argument is the path to the script
+            ),
+            timeout=15,
+            ),
+            tool_filter=['load_web_page'] # Optional: ensure only specific tools are loaded
+        )
+    ],
+)
+
+app = App(
+    name="adk_mcp_server",
+    root_agent=root_agent,
+    plugins=plugins
+)
+# UNCOMMENT THE LINE BELOW TO TEST FAILOVER:
+### Is there a way to add something here for testing purpose.
+
+
+#-----
+
+#---- adk_mcp_server
+
+
+
+#-----
+
+#---- adk_mcp_server/adk_server.py
+
+import asyncio
+import json
+import os
+from dotenv import load_dotenv
+
+# MCP Server Imports
+from mcp import types as mcp_types # Use alias to avoid conflict
+from mcp.server.lowlevel import Server, NotificationOptions
+from mcp.server.models import InitializationOptions
+import mcp.server.stdio # For running as a Standard Input/Output server
+
+# ADK Tool Imports
+from google.adk.tools.function_tool import FunctionTool
+from google.adk.tools.load_web_page import load_web_page # Example ADK tool
+# ADK <-> MCP Conversion Utility
+from google.adk.tools.mcp_tool.conversion_utils import adk_to_mcp_tool_type
+
+# --- Load Environment Variables (If ADK tools need them, e.g., API keys) ---
+load_dotenv() # Loads .env file in the same directory
+
+# --- Prepare the ADK Tool ---
+# Instantiate the ADK tool you want to expose.
+# This tool will be wrapped and called by the MCP server.
+print("Initializing ADK load_web_page tool...")
+adk_tool_to_expose = FunctionTool(load_web_page)
+print(f"ADK tool '{adk_tool_to_expose.name}' initialized and ready to be exposed via MCP.")
+# --- End ADK Tool Prep ---
+
+# --- MCP Server Setup ---
+print("Creating MCP Server instance...")
+# Create a named MCP Server instance using the mcp.server library
+app = Server("adk-tool-exposing-mcp-server")
+
+# Implement the MCP server's handler to list available tools
+@app.list_tools()
+async def list_mcp_tools() -> list[mcp_types.Tool]:
+    """MCP handler to list tools this server exposes."""
+    print("MCP Server: Received list_tools request.")
+    # Convert the ADK tool's definition to the MCP Tool schema format
+    mcp_tool_schema = adk_to_mcp_tool_type(adk_tool_to_expose)
+    print(f"MCP Server: Advertising tool: {mcp_tool_schema.name}")
+    return [mcp_tool_schema]
+
+# Implement the MCP server's handler to execute a tool call
+@app.call_tool()
+async def call_mcp_tool(
+    name: str, arguments: dict
+) -> list[mcp_types.Content]: # MCP uses mcp_types.Content
+    """MCP handler to execute a tool call requested by an MCP client."""
+    print(f"MCP Server: Received call_tool request for '{name}' with args: {arguments}")
+
+    # Check if the requested tool name matches our wrapped ADK tool
+    if name == adk_tool_to_expose.name:
+        try:
+            # Execute the ADK tool's run_async method.
+            # Note: tool_context is None here because this MCP server is
+            # running the ADK tool outside of a full ADK Runner invocation.
+            # If the ADK tool requires ToolContext features (like state or auth),
+            # this direct invocation might need more sophisticated handling.
+            adk_tool_response = await adk_tool_to_expose.run_async(
+                args=arguments,
+                tool_context=None,
+            )
+            print(f"MCP Server: ADK tool '{name}' executed. Response: {adk_tool_response}")
+
+            # Format the ADK tool's response (often a dict) into an MCP-compliant format.
+            # Here, we serialize the response dictionary as a JSON string within TextContent.
+            # Adjust formatting based on the ADK tool's output and client needs.
+            response_text = json.dumps(adk_tool_response, indent=2)
+            # MCP expects a list of mcp_types.Content parts
+            return [mcp_types.TextContent(type="text", text=response_text)]
+
+        except Exception as e:
+            print(f"MCP Server: Error executing ADK tool '{name}': {e}")
+            # Return an error message in MCP format
+            error_text = json.dumps({"error": f"Failed to execute tool '{name}': {str(e)}"})
+            return [mcp_types.TextContent(type="text", text=error_text)]
+    else:
+        # Handle calls to unknown tools
+        print(f"MCP Server: Tool '{name}' not found/exposed by this server.")
+        error_text = json.dumps({"error": f"Tool '{name}' not implemented by this server."})
+        return [mcp_types.TextContent(type="text", text=error_text)]
+
+# --- MCP Server Runner ---
+async def run_mcp_stdio_server():
+    """Runs the MCP server, listening for connections over standard input/output."""
+    # Use the stdio_server context manager from the mcp.server.stdio library
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        print("MCP Stdio Server: Starting handshake with client...")
+        await app.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name=app.name, # Use the server name defined above
+                server_version="0.1.0",
+                capabilities=app.get_capabilities(
+                    # Define server capabilities - consult MCP docs for options
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
+        print("MCP Stdio Server: Run loop finished or client disconnected.")
+
+if __name__ == "__main__":
+    print("Launching MCP Server to expose ADK tools via stdio...")
+    try:
+        asyncio.run(run_mcp_stdio_server())
+    except KeyboardInterrupt:
+        print("\nMCP Server (stdio) stopped by user.")
+    except Exception as e:
+        print(f"MCP Server (stdio) encountered an error: {e}")
+    finally:
+        print("MCP Server (stdio) process exiting.")
+# --- End MCP Server ---
+
+#-----
+
+
+
+python3 ~/adk_mcp_tools/adk_mcp_server/adk_server.py
+
+export PATH=$PATH:"/home/${USER}/.local/bin"
+cd ~/adk_mcp_tools
+adk web
+--allow_origins "regex:https://.*.cloudshell.dev"
+--otel_to_cloud
+--reload_agents
+
